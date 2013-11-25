@@ -158,6 +158,10 @@ PRODUCT_PACKAGES += \
 PRODUCT_COPY_FILES += \
     device/lge/hammerhead/gps.conf:system/etc/gps.conf
 
+# TWRP fstab
+PRODUCT_COPY_FILES += \
+    device/lge/hammerhead/twrp.fstab:root/etc/twrp.fstab
+
 # GPS
 PRODUCT_PACKAGES += \
     libloc_adapter \
