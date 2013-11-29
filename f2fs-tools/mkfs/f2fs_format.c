@@ -19,14 +19,13 @@
 #include <sys/mount.h>
 #include <time.h>
 #include <linux/fs.h>
-//#include <uuid/uuid.h>
 
 #include "include/f2fs_fs.h"
 
 #define F2FS_MAJOR_VERSION 1
 #define F2FS_MINOR_VERSION 1
 #define F2FS_TOOLS_VERSION "1.1.0"
-#define F2FS_TOOLS_DATE "2012-11-29"
+#define F2FS_TOOLS_DATE "2012-11-29 mmi"
 #define BLKDISCARD _IO(0x12,119)
 
 extern struct f2fs_configuration config;
@@ -78,13 +77,14 @@ static void mkfs_usage()
 	MSG(0, "  -o overprovision ratio [default:5]\n");
 	MSG(0, "  -s # of segments per section [default:1]\n");
 	MSG(0, "  -z # of sections per zone [default:1]\n");
-	MSG(0, "  -t 0: nodiscard, 1: discard [default:1]\n");
+	MSG(0, "  -r reserved_bytes [default:0]\n");
+	MSG(0, "     (use only device_size-reserved_bytes for filesystem)\n");
 	exit(1);
 }
 
 static void f2fs_parse_options(int argc, char *argv[])
 {
-	static const char *option_string = "a:d:e:l:o:s:z:t:";
+	static const char *option_string = "a:d:e:l:o:s:z:r:";
 	int32_t option=0;
 
 	while ((option = getopt(argc,argv,option_string)) != EOF) {
@@ -108,7 +108,7 @@ static void f2fs_parse_options(int argc, char *argv[])
 						512 characters\n");
 				mkfs_usage();
 			}
-			config.vol_label = optarg;
+			sprintf((char *)config.vol_label, "%s", optarg);
 			MSG(0, "Info: Label = %s\n", config.vol_label);
 			break;
 		case 'o':
@@ -125,9 +125,8 @@ static void f2fs_parse_options(int argc, char *argv[])
 			config.secs_per_zone = atoi(optarg);
 			MSG(0, "Info: Sections per zone = %d\n", atoi(optarg));
 			break;
-		case 't':
-			config.trim = atoi(optarg);
-			MSG(0, "Info: Trim is %s\n", config.trim ? "enabled": "disabled");
+		case 'r':
+			config.bytes_reserved = atoi(optarg);
 			break;
 		default:
 			MSG(0, "\tError: Unknown option %c\n",option);
@@ -171,9 +170,6 @@ const char *media_ext_lists[] = {
 	"mpe",
 	"rm",
 	"ogg",
-	"jpeg",
-	"video",
-	"apk",	/* for android system */
 	NULL
 };
 
@@ -410,14 +406,15 @@ static int f2fs_prepare_super_block(void)
 
 	uuid_generate(super_block.uuid);
 
-	ASCIIToUNICODE(super_block.volume_name, (u_int8_t *)config.vol_label);
+	ASCIIToUNICODE(super_block.volume_name, config.vol_label);
 
 	super_block.node_ino = cpu_to_le32(1);
 	super_block.meta_ino = cpu_to_le32(2);
 	super_block.root_ino = cpu_to_le32(3);
 
-	total_zones = le32_to_cpu(super_block.segment_count_main) /
-			(config.segs_per_sec * config.secs_per_zone);
+	total_zones = ((le32_to_cpu(super_block.segment_count_main) - 1) /
+			config.segs_per_sec) /
+			config.secs_per_zone;
 	if (total_zones <= 6) {
 		MSG(1, "\tError: %d zones: Need more zones \
 			by shrinking zone size\n", total_zones);
@@ -568,7 +565,7 @@ static int f2fs_write_check_point_pack(void)
 	}
 
 	/* 1. cp page 1 of checkpoint pack 1 */
-	ckp->checkpoint_ver = cpu_to_le64(1);
+	ckp->checkpoint_ver = 1;
 	ckp->cur_node_segno[0] =
 		cpu_to_le32(config.cur_seg[CURSEG_HOT_NODE]);
 	ckp->cur_node_segno[1] =
@@ -606,7 +603,7 @@ static int f2fs_write_check_point_pack(void)
 			le32_to_cpu(ckp->overprov_segment_count)) *
 			 config.blks_per_seg));
 	ckp->cp_pack_total_block_count = cpu_to_le32(8);
-	ckp->ckpt_flags = cpu_to_le32(CP_UMOUNT_FLAG);
+	ckp->ckpt_flags |= CP_UMOUNT_FLAG;
 	ckp->cp_pack_start_sum = cpu_to_le32(1);
 	ckp->valid_node_count = cpu_to_le32(1);
 	ckp->valid_inode_count = cpu_to_le32(1);
@@ -621,11 +618,12 @@ static int f2fs_write_check_point_pack(void)
 			((le32_to_cpu(super_block.segment_count_nat) / 2) <<
 			 le32_to_cpu(super_block.log_blocks_per_seg)) / 8);
 
-	ckp->checksum_offset = cpu_to_le32(CHECKSUM_OFFSET);
+	ckp->checksum_offset = cpu_to_le32(4092);
 
-	crc = f2fs_cal_crc32(F2FS_SUPER_MAGIC, ckp, CHECKSUM_OFFSET);
-	*((__le32 *)((unsigned char *)ckp + CHECKSUM_OFFSET)) =
-							cpu_to_le32(crc);
+	crc = f2fs_cal_crc32(F2FS_SUPER_MAGIC, ckp,
+					le32_to_cpu(ckp->checksum_offset));
+	*((u_int32_t *)((unsigned char *)ckp +
+				le32_to_cpu(ckp->checksum_offset))) = crc;
 
 	blk_size_bytes = 1 << le32_to_cpu(super_block.log_blocksize);
 	cp_seg_blk_offset = le32_to_cpu(super_block.segment0_blkaddr);
@@ -732,9 +730,11 @@ static int f2fs_write_check_point_pack(void)
 	 */
 	ckp->checkpoint_ver = 0;
 
-	crc = f2fs_cal_crc32(F2FS_SUPER_MAGIC, ckp, CHECKSUM_OFFSET);
-	*((__le32 *)((unsigned char *)ckp + CHECKSUM_OFFSET)) =
-							cpu_to_le32(crc);
+	crc = f2fs_cal_crc32(F2FS_SUPER_MAGIC, ckp,
+					le32_to_cpu(ckp->checksum_offset));
+	*((u_int32_t *)((unsigned char *)ckp +
+				le32_to_cpu(ckp->checksum_offset))) = crc;
+
 	cp_seg_blk_offset = (le32_to_cpu(super_block.segment0_blkaddr) +
 				config.blks_per_seg) *
 				blk_size_bytes;
@@ -829,12 +829,7 @@ static int f2fs_write_root_inode(void)
 
 	memset(raw_node, 0xff, sizeof(struct f2fs_node));
 
-	/* avoid power-off-recovery based on roll-forward policy */
-	main_area_node_seg_blk_offset = le32_to_cpu(super_block.main_blkaddr);
-	main_area_node_seg_blk_offset += config.cur_seg[CURSEG_WARM_NODE] *
-					config.blks_per_seg;
-        main_area_node_seg_blk_offset *= blk_size_bytes;
-
+	main_area_node_seg_blk_offset += F2FS_BLKSIZE;
 	if (dev_write(raw_node, main_area_node_seg_blk_offset, F2FS_BLKSIZE)) {
 		MSG(1, "\tError: While writing the raw_node to disk!!!\n");
 		return -1;
@@ -855,18 +850,18 @@ static int f2fs_update_nat_root(void)
 	}
 
 	/* update root */
-	nat_blk->entries[le32_to_cpu(super_block.root_ino)].block_addr = cpu_to_le32(
+	nat_blk->entries[super_block.root_ino].block_addr = cpu_to_le32(
 		le32_to_cpu(super_block.main_blkaddr) +
 		config.cur_seg[CURSEG_HOT_NODE] * config.blks_per_seg);
-	nat_blk->entries[le32_to_cpu(super_block.root_ino)].ino = super_block.root_ino;
+	nat_blk->entries[super_block.root_ino].ino = super_block.root_ino;
 
 	/* update node nat */
-	nat_blk->entries[le32_to_cpu(super_block.node_ino)].block_addr = cpu_to_le32(1);
-	nat_blk->entries[le32_to_cpu(super_block.node_ino)].ino = super_block.node_ino;
+	nat_blk->entries[super_block.node_ino].block_addr = cpu_to_le32(1);
+	nat_blk->entries[super_block.node_ino].ino = super_block.node_ino;
 
 	/* update meta nat */
-	nat_blk->entries[le32_to_cpu(super_block.meta_ino)].block_addr = cpu_to_le32(1);
-	nat_blk->entries[le32_to_cpu(super_block.meta_ino)].ino = super_block.meta_ino;
+	nat_blk->entries[super_block.meta_ino].block_addr = cpu_to_le32(1);
+	nat_blk->entries[super_block.meta_ino].ino = super_block.meta_ino;
 
 	blk_size_bytes = 1 << le32_to_cpu(super_block.log_blocksize);
 	nat_seg_blk_offset = le32_to_cpu(super_block.nat_blkaddr);
@@ -954,9 +949,6 @@ int f2fs_trim_device()
 	unsigned long long range[2];
 	struct stat stat_buf;
 
-	if (!config.trim)
-		return 0;
-
 	range[0] = 0;
 	range[1] = config.total_sectors * DEFAULT_SECTOR_SIZE;
 
@@ -965,7 +957,6 @@ int f2fs_trim_device()
 		return -1;
 	}
 
-	MSG(0, "Info: Discarding device\n");
 	if (S_ISREG(stat_buf.st_mode))
 		return 0;
 	else if (S_ISBLK(stat_buf.st_mode)) {
@@ -1038,9 +1029,9 @@ exit:
 	return err;
 }
 
-int make_f2fs_main(int argc, char *argv[])
+int main(int argc, char *argv[])
 {
-	MSG(0, "\n\tF2FS-tools: mkfs.f2fs Ver: %s (%s)\n\n",
+	MSG(0, "\n\tF2FS-tools: mkfs.f2fs Ver: %s (%s) [modified by Motorola for ARM and to reserve space]\n\n",
 				F2FS_TOOLS_VERSION,
 				F2FS_TOOLS_DATE);
 	f2fs_init_configuration(&config);
@@ -1048,7 +1039,7 @@ int make_f2fs_main(int argc, char *argv[])
 	f2fs_parse_options(argc, argv);
 
 	/*
-	if (f2fs_dev_is_umounted(&config) < 0)
+	if (f2fs_dev_is_mounted(&config) < 0)
 		return -1;
 	*/
 
